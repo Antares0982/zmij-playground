@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Build zmij shared libraries (.so) and assembly files (.s) for C, C++, and Rust.
+"""Build zmij shared libraries (.so) and assembly files (.s) for C++ and Rust.
 
-This script is fully portable — it assumes clang, clang++, and cargo are
-available in PATH.
+This script is fully portable — it assumes clang and clang++ are available in
+PATH. Rust (cargo) is optional: when it is missing the Rust library is skipped.
 """
 
 import argparse
@@ -19,33 +19,6 @@ ROOT = Path(__file__).resolve().parent
 def run(cmd: list[str], **kwargs) -> None:
     print(f"  → {' '.join(cmd)}", flush=True)
     subprocess.check_call(cmd, **kwargs)
-
-
-# --------------------------------------------------------------------------- #
-# C build
-# --------------------------------------------------------------------------- #
-
-
-def build_c(output_dir: Path, cc: str, extra_cflags: list[str]) -> None:
-    print("\n=== Building zmij-c ===", flush=True)
-    src = ROOT / "zmij-c" / "zmij.c"
-    so_out = output_dir / "libzmij_c.so"
-    asm_out = output_dir / "zmij_c.s"
-
-    common = [
-        cc,
-        "-std=gnu17",
-        "-O3",
-        "-DNDEBUG",
-        "-fPIC",
-        "-fno-stack-protector",
-        "-fomit-frame-pointer",
-    ] + extra_cflags
-
-    # shared library
-    run(common + ["-shared", "-o", str(so_out), str(src)])
-    # assembly
-    run(common + ["-S", "-g", "-o", str(asm_out), str(src)])
 
 
 # --------------------------------------------------------------------------- #
@@ -85,7 +58,16 @@ def build_cpp(output_dir: Path, cxx: str, extra_cflags: list[str]) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def build_rust(output_dir: Path, extra_rustflags: str) -> None:
+def have_cargo() -> bool:
+    return shutil.which("cargo") is not None
+
+
+def build_rust(output_dir: Path, extra_rustflags: str) -> bool:
+    """Build zmij-rust if cargo is available. Returns True if built."""
+    if not have_cargo():
+        print("\n=== Skipping zmij-rust (cargo not found in PATH) ===", flush=True)
+        return False
+
     print("\n=== Building zmij-rust ===", flush=True)
     rust_dir = ROOT / "zmij-rust"
 
@@ -149,6 +131,8 @@ def build_rust(output_dir: Path, extra_rustflags: str) -> None:
         print(f"  → copied {asm_src} → {asm_dst}")
     else:
         print("  ⚠ Could not locate Rust assembly output", file=sys.stderr)
+
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -254,7 +238,7 @@ def build_asm(output_dir: Path, cc: str, extra_cflags: list[str]) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build zmij shared libraries for C, C++, and Rust"
+        description="Build zmij shared libraries for C++ and Rust"
     )
     parser.add_argument(
         "--output-dir",
@@ -270,6 +254,11 @@ def main() -> None:
         choices=["clang", "gcc"],
         default="clang",
         help="C/C++ compiler family (default: clang)",
+    )
+    parser.add_argument(
+        "--no-rust",
+        action="store_true",
+        help="Skip the Rust build even if cargo is available",
     )
     args = parser.parse_args()
 
@@ -292,9 +281,17 @@ def main() -> None:
     else:
         print("SSE4.1 mode: disabled (baseline)")
 
-    build_c(output_dir, cc, extra_cflags)
     build_cpp(output_dir, cxx, extra_cflags)
-    build_rust(output_dir, extra_rustflags)
+    if args.no_rust:
+        print("\n=== Skipping zmij-rust (--no-rust) ===", flush=True)
+        rust_built = False
+    else:
+        rust_built = build_rust(output_dir, extra_rustflags)
+    if not rust_built:
+        # Drop artifacts from an earlier run so the benchmark does not silently
+        # pick up a stale Rust library built with different flags.
+        for stale in ("libzmij_rust.so", "zmij_rust.s"):
+            (output_dir / stale).unlink(missing_ok=True)
     build_xjb(output_dir, cxx, extra_cflags)
     build_asm(output_dir, cc, extra_cflags)
 

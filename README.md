@@ -51,12 +51,14 @@ Apple M4:
 ## Prerequisites
 
 - **Nix** (recommended) — provides all build tools in a reproducible environment
-- Or install manually: `clang`, `clang++`, `cargo` (Rust), `cmake`, `python3`
+- Or install manually: `clang`, `clang++`, `cmake`, `python3`
+- Optional: `cargo` (Rust). When it is missing, the Rust implementation is simply
+  skipped — everything else still builds.
 
 ## Quick Start
 
 ```bash
-# Enter development shell (provides clang, cargo, cmake, python3)
+# Enter development shell (provides clang, cmake, python3)
 nix develop
 
 # Build everything (libraries + benchmark executables)
@@ -72,11 +74,17 @@ cmake --build build
 ./build/any_ftoa_benchmark \
     ./build/libs/libxjb.so:xjb64:xjb32 \
     ./build/libs/libzmij_cpp.so:zmijcpp_detail_write_double:zmijcpp_detail_write_float \
-    ./build/libs/libzmij_c.so:zmij_detail_write_double:zmij_detail_write_float \
     ./build/libs/libzmij_rust.so:zmijrust_detail_write_double:zmijrust_detail_write_float
 ```
 
-See [`compare-all.sh`](compare-all.sh) for a full example that builds and benchmarks all included libraries.
+For a full example that builds and benchmarks all included libraries, pick the driver
+for your platform:
+
+- [`compare-x64.sh`](compare-x64.sh) — x86-64 Linux, the `{SSE2, SSE4.1} × {clang, gcc}` matrix (4 variants)
+- [`compare-aarch64.sh`](compare-aarch64.sh) — aarch64 Linux, `{clang, gcc}` (2 variants)
+- [`compare-aarch64-apple.sh`](compare-aarch64-apple.sh) — Apple silicon, single toolchain
+
+Each forwards extra arguments to `any_ftoa_benchmark` (e.g. `./compare-x64.sh --rounds 1000`).
 
 ## Running the Benchmark
 
@@ -89,8 +97,8 @@ Each `<lib_spec>` has the format `path[:sym_double[:sym_float]]`. If symbol name
 ### Examples
 
 ```bash
-# Benchmark two libraries with default symbol names
-./build/any_ftoa_benchmark build/libs/libzmij_c.so build/libs/libzmij_cpp.so
+# Benchmark a library with default symbol names
+./build/any_ftoa_benchmark build/libs/libzmij_cpp.so
 
 # Custom symbols and input file
 ./build/any_ftoa_benchmark --test-input my_data.txt build/libs/libxjb.so:xjb64:xjb32
@@ -103,7 +111,6 @@ Each `<lib_spec>` has the format `path[:sym_double[:sym_float]]`. If symbol name
 
 ```
 === float benchmark (1000 rounds × 91932 values, 100 warmup) ===
-  C               91932000 calls        769.49 ms total      8.37 ± 0.50 ns/call  (sink=1301891800)
   C++             91932000 calls        749.55 ms total      8.15 ± 0.08 ns/call  (sink=897356900)
   Rust            91932000 calls        798.53 ms total      8.69 ± 0.10 ns/call  (sink=897438300)
 ```
@@ -173,8 +180,14 @@ This will:
 ### Libraries Only
 
 ```bash
-python3 build_libs.py [--output-dir <dir>] [--sse41] [--cc clang]
+python3 build_libs.py [--output-dir <dir>] [--sse41] [--cc clang] [--no-rust]
 ```
+
+### Rust (optional)
+
+The Rust toolchain is not required. CMake probes for `cargo` and disables the Rust
+library when it is absent; pass `-DWITH_RUST=OFF` to skip it even when `cargo` is
+installed. `build_libs.py` does the same probing and accepts `--no-rust`.
 
 ### SSE4.1 / AVX2 Mode
 
@@ -196,7 +209,7 @@ Each `<lib_spec>` is `path[:sym_double]`. Exits with code 1 if any mismatches ar
 
 ```bash
 ./build/verifier build/libs/libzmij_cpp.so
-./build/verifier --test-input my_data.txt build/libs/libzmij_c.so:zmij_detail_write_double
+./build/verifier --test-input my_data.txt build/libs/libxjb.so:xjb64
 ```
 
 ## Design Notes

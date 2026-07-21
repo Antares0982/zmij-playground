@@ -3,6 +3,7 @@ project(zmij-benchmark C)
 
 option(SSE41 "Enable SSE4.1 for all zmij builds" OFF)
 option(USE_GCC "Use gcc instead of clang" OFF)
+option(WITH_RUST "Build the Rust implementation (auto-detected if not set)" ON)
 
 # --------------------------------------------------------------------------- #
 # Build shared libraries via build_libs.py
@@ -20,26 +21,42 @@ if(USE_GCC)
   list(APPEND BUILD_LIBS_ARGS "--cc" "gcc")
 endif()
 
+# Rust is optional: build it only when explicitly requested *and* cargo exists.
+find_program(CARGO_EXECUTABLE cargo)
+if(WITH_RUST AND CARGO_EXECUTABLE)
+  set(BUILD_RUST ON)
+  message(STATUS "zmij-rust: enabled (cargo: ${CARGO_EXECUTABLE})")
+elseif(WITH_RUST)
+  set(BUILD_RUST OFF)
+  message(STATUS "zmij-rust: disabled (cargo not found in PATH)")
+else()
+  set(BUILD_RUST OFF)
+  message(STATUS "zmij-rust: disabled (WITH_RUST=OFF)")
+endif()
+
+set(LIB_OUTPUTS "${LIB_OUTPUT_DIR}/libzmij_cpp.so"
+                "${LIB_OUTPUT_DIR}/libxjb.so")
+set(LIB_SOURCES
+    "${CMAKE_SOURCE_DIR}/zmij-cpp/zmij.cc"
+    "${CMAKE_SOURCE_DIR}/zmij-cpp/zmij.h" "${CMAKE_SOURCE_DIR}/xjb/ftoa.cpp")
+
+if(BUILD_RUST)
+  list(APPEND LIB_OUTPUTS "${LIB_OUTPUT_DIR}/libzmij_rust.so")
+  list(APPEND LIB_SOURCES "${CMAKE_SOURCE_DIR}/zmij-rust/src/lib.rs"
+       "${CMAKE_SOURCE_DIR}/zmij-rust/Cargo.toml")
+else()
+  list(APPEND BUILD_LIBS_ARGS "--no-rust")
+endif()
+
 add_custom_command(
-  OUTPUT "${LIB_OUTPUT_DIR}/libzmij_c.so" "${LIB_OUTPUT_DIR}/libzmij_cpp.so"
-         "${LIB_OUTPUT_DIR}/libzmij_rust.so" "${LIB_OUTPUT_DIR}/libxjb.so"
+  OUTPUT ${LIB_OUTPUTS}
   COMMAND python3 ${BUILD_LIBS_ARGS}
-  DEPENDS "${PYTHON_SCRIPT}"
-          "${CMAKE_SOURCE_DIR}/zmij-c/zmij.c"
-          "${CMAKE_SOURCE_DIR}/zmij-c/zmij-c.h"
-          "${CMAKE_SOURCE_DIR}/zmij-cpp/zmij.cc"
-          "${CMAKE_SOURCE_DIR}/zmij-cpp/zmij.h"
-          "${CMAKE_SOURCE_DIR}/zmij-rust/src/lib.rs"
-          "${CMAKE_SOURCE_DIR}/zmij-rust/Cargo.toml"
-          "${CMAKE_SOURCE_DIR}/xjb/ftoa.cpp"
+  DEPENDS "${PYTHON_SCRIPT}" ${LIB_SOURCES}
   WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
   COMMENT "Building zmij shared libraries via build_libs.py"
   VERBATIM)
 
-add_custom_target(
-  ftoa_libs ALL
-  DEPENDS "${LIB_OUTPUT_DIR}/libzmij_c.so" "${LIB_OUTPUT_DIR}/libzmij_cpp.so"
-          "${LIB_OUTPUT_DIR}/libzmij_rust.so" "${LIB_OUTPUT_DIR}/libxjb.so")
+add_custom_target(ftoa_libs ALL DEPENDS ${LIB_OUTPUTS})
 
 # --------------------------------------------------------------------------- #
 # Benchmark executable

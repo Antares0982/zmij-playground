@@ -156,8 +156,6 @@ int main(int argc, char** argv) {
   struct {
     const char *file, *name, *sym_float, *sym_double;
   } lib_specs[] = {
-      {"libzmij_c.so", "C", "zmij_detail_write_float",
-       "zmij_detail_write_double"},
       {"libzmij_cpp.so", "C++", "zmijcpp_detail_write_float",
        "zmijcpp_detail_write_double"},
       {"libzmij_rust.so", "Rust", "zmijrust_detail_write_float",
@@ -210,7 +208,6 @@ int main(int argc, char** argv) {
       "warmup) ===\n",
       total_rounds, vals.count, repeats, WARMUP_ROUNDS);
   for (int rep = 0; rep < repeats; rep++) {
-    printf("  [repeat %d/%d]\n", rep + 1, repeats);
     fflush(stdout);
     rotate_order(order, nlibs, rep);
     for (int k = 0; k < nlibs; k++) {
@@ -230,7 +227,6 @@ int main(int argc, char** argv) {
       "warmup) ===\n",
       total_rounds, vals.count, repeats, WARMUP_ROUNDS);
   for (int rep = 0; rep < repeats; rep++) {
-    printf("  [repeat %d/%d]\n", rep + 1, repeats);
     fflush(stdout);
     rotate_order(order, nlibs, rep);
     for (int k = 0; k < nlibs; k++) {

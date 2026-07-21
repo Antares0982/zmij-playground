@@ -601,6 +601,12 @@ struct exp_float_shuffle_table {
   }
 };
 
+constexpr auto fixed_entry_align() noexcept -> int {
+  if (ZMIJ_USE_SSE4_1) return 64;  // Align to a cache line.
+  // Align entry to 32 bytes so indexing uses `lsl #5` not `umaddl`.
+  return ZMIJ_AARCH64 && !ZMIJ_OPTIMIZE_SIZE ? 32 : 1;
+}
+
 // Per-decimal-exponent buffer layout for branchless fixed-notation output.
 // Each entry holds the byte positions of the leading zeros, decimal point,
 // and end of output, indexed by the decimal exponent (dec_exp).
@@ -609,13 +615,23 @@ struct fixed_layout_table {
   static constexpr int num_entries =
       traits::max_fixed_dec_exp - traits::min_fixed_dec_exp + 1;
 
-  // On AArch64, align entry to 32 bytes so indexing uses `lsl #5` not `umaddl`.
-  struct alignas(ZMIJ_AARCH64 && !ZMIJ_OPTIMIZE_SIZE ? 32 : 1) entry {
+  struct alignas(fixed_entry_align()) entry {
+#if ZMIJ_USE_SSE4_1
+    // pshufb table mapping BCD bytes to their output slots; the decimal-point
+    // slot (if any) holds a zero-marker (high bit set). Indexed by extra_digit.
+    // Read via aligned load (_mm_load_si128), so must be 16-byte aligned.
+    alignas(16) unsigned char shuffle[2][16];
+#endif
     // Byte offset past leading "0.00..." before first significant digit.
     unsigned char start_pos;
     unsigned char point_pos;
     // Start position for shifting digits right by one to insert the point.
     unsigned char shift_pos;
+#if ZMIJ_USE_SSE4_1
+    // Buffer-relative position of the last_digit byte, indexed by
+    // has_extra_digit. Only used for bcd_size == 16 (doubles).
+    unsigned char last_digit_pos[2];
+#endif
     // Offset past the end of fixed-notation output, indexed by sig length - 1.
     unsigned char end_pos[traits::max_digits10];
   };
@@ -629,6 +645,24 @@ struct fixed_layout_table {
       e.start_pos = dec_exp < -0 ? 1 - dec_exp : 0;
       e.point_pos = dec_exp >= 0 ? 1 + dec_exp : 1;
       e.shift_pos = e.point_pos + (dec_exp >= 0);
+
+#if ZMIJ_USE_SSE4_1
+      constexpr int bcd_size = 16;
+      for (int extra = 0; extra < 2; ++extra) {
+        int len = bcd_size + extra - 1;
+        e.last_digit_pos[extra] = len + (0 <= dec_exp && dec_exp < len);
+      }
+
+      // Build the shuffle tables from natural-order BCD (to_digits puts BCD[k]
+      // at byte k). extra_digit == 0 drops the leading zero, so digits start at
+      // BCD[!extra]; point_slot gets a pshufb zero-marker (0xFF) for the point.
+      int point_slot = (dec_exp >= 0 && dec_exp <= 14) ? 1 + dec_exp : 128;
+      for (int extra = 0; extra < 2; ++extra) {
+        unsigned char bcd_idx = !extra;
+        for (int i = 0; i < bcd_size; ++i)
+          e.shuffle[extra][i] = i == point_slot ? 0xFF : bcd_idx++;
+      }
+#endif  // ZMIJ_USE_SSE4_1
 
       for (int n = 1; n <= traits::max_digits10; ++n) {
         int end_pos = n;
@@ -1260,7 +1294,7 @@ ZMIJ_INLINE auto write(Float value, char* buffer) noexcept -> char* {
       dec_exp <= traits::max_fixed_dec_exp) {
     memcpy(start, &zeros, 8);  // For dec_exp < 0.
     char last_digit = '0' + (-has_last_digit & dec.last_digit);
-    int num_digits = has_last_digit ? bcd_size : dig.num_digits - 1;
+    int num_digits = select(has_last_digit, bcd_size, dig.num_digits - 1);
 
     // Materialize the base early so the entry address is `base + idx*32`;
     // otherwise Clang folds the offset in and adds a cycle to the idx chain.
@@ -1269,6 +1303,20 @@ ZMIJ_INLINE auto write(Float value, char* buffer) noexcept -> char* {
 
     const auto& layout = fixed_layouts->get(dec_exp);
     buffer += layout.start_pos;
+#if ZMIJ_USE_SSE4_1
+    if (bcd_size == 16) {
+      auto& digits = reinterpret_cast<const __m128i&>(dig.digits);
+      __m128i tbl = _mm_load_si128(m128ptr(&layout.shuffle[has_extra_digit]));
+      __m128i out = _mm_shuffle_epi8(digits, tbl);
+      memcpy(buffer, &out, bcd_size);  // Store the assembled digits in one go.
+      // The point can push BCD[15] outside the vector to buffer[16], so write
+      // it unconditionally (otherwise it's in-vector or overwritten below).
+      buffer[bcd_size] = char(_mm_extract_epi8(digits, 15));
+      start[layout.point_pos] = '.';
+      buffer[layout.last_digit_pos[has_extra_digit]] = last_digit;
+      return buffer + layout.end_pos[num_digits + has_extra_digit - 1];
+    }
+#endif  // ZMIJ_USE_SSE4_1
     write_digits(buffer, dig.digits, !has_extra_digit, *d);
     buffer[bcd_size + has_extra_digit - 1] = last_digit;
     unsigned point_pos = layout.point_pos;

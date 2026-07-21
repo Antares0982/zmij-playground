@@ -143,7 +143,6 @@ int main(int argc, char** argv) {
         "warmup) ===\n",
         total_rounds, vals.count, repeats, WARMUP_ROUNDS);
     for (int rep = 0; rep < repeats; rep++) {
-      printf("  [repeat %d/%d]\n", rep + 1, repeats);
       fflush(stdout);
       rotate_order(order, nlibs, rep);
       for (int k = 0; k < nlibs; k++) {
@@ -168,7 +167,6 @@ int main(int argc, char** argv) {
       "===\n",
       total_rounds, vals.count, repeats, WARMUP_ROUNDS);
   for (int rep = 0; rep < repeats; rep++) {
-    printf("  [repeat %d/%d]\n", rep + 1, repeats);
     fflush(stdout);
     rotate_order(order, nlibs, rep);
     for (int k = 0; k < nlibs; k++) {
