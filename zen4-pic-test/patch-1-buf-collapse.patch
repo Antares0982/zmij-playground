@@ -1,0 +1,12 @@
+--- a/xjb/ftoa.cpp
++++ b/xjb/ftoa.cpp
+@@ -1263,6 +1263,9 @@
+     memcpy(&vi, &v, sizeof(v));
+     *buf = '-';
+     buf += vi >> 63;
++#if defined(__x86_64__) && (defined(__clang__) || defined(__GNUC__))
++    asm("" : "+r"(buf));  // collapse (orig_buf, sign) into one live pointer to cut PIC reg pressure
++#endif
+     u64 sig = vi & ((1ULL << 52) - 1);
+     u64 exp = (vi << 1) >> 53;
+     i64 q = (i64)exp - 1075;
