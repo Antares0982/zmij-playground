@@ -126,16 +126,6 @@
 #    define XJB_NOT_REMOVE_FIRST_ZERO 0
 #endif
 
-// Fix performance regression on Zen4 under -fPIC.
-// But this mitigation is not needed on intel platforms, because intel has a fast AGU path for scaled-index load.
-// Above mitigation is only for Zen4, but we don't have a way to detect Zen4, so we just enable it for all x86-64 under
-// -fPIC. On intel i7 13700k, may cause 4% performance regression.
-#if defined(__x86_64__) && defined(__PIC__) && (defined(__clang__) || defined(__GNUC__)) && !defined(_MSC_VER)
-#    define XJB_NO_PIC_MITIGATION 0
-#else
-#    define XJB_NO_PIC_MITIGATION 1
-#endif
-
 /* Some compiler checks. */
 
 // Is the compiler really GCC.
@@ -368,7 +358,6 @@ struct const_value_float {
     uint64_t m;
     uint32_t e7;
     uint32_t e6;
-    // uint32_t e5;
 #if XJB_USE_NEON
     int32x4_t m32_4;
 #else
@@ -417,8 +406,6 @@ struct double_table_t {
             int e10 = i - 293;
             pow10_double[(num_pow10 - 1 - i) * 2 + 0] = e10 == 0 ? 1ULL << 63 : current.w2 + (e10 >= 0 && e10 <= 27);
             pow10_double[(num_pow10 - 1 - i) * 2 + 1] = current.w1 + 1;
-            // pow10_double[(num_pow10 - 1 - i) ] = e10 == 0 ? 1ULL << 63 : current.w2 + (e10 >= 0 && e10 <= 27);
-            // pow10_double[(num_pow10 - 1 - i)  + num_pow10] = current.w1 + 1;
             uint64_t h0 = umul128_hi64_fallback(current.w0, ten);
             uint64_t h1 = umul128_hi64_fallback(current.w1, ten);
             uint64_t c0 = h0 + current.w1 * ten;
@@ -693,7 +680,6 @@ static inline shortest_ascii16 to_ascii16_no_memmove_sse41(char* buf, uint64_t u
     __m128i bcd_swapped =
         _mm_add_epi16(z, _mm_mullo_epi16(_mm_set1_epi16((1 << 8) - 10), _mm_mulhi_epu16(z, _mm_set1_epi16(0x199a))));
     __m128i ascii16_swapped = _mm_add_epi8(bcd_swapped, _mm_set1_epi8('0'));
-    //_mm_storeu_si128((__m128i*)buf, _mm_set1_epi8('0'));
     __m128i ascii16 = _mm_shuffle_epi8(ascii16_swapped, move_shuffler);
     int mask = _mm_movemask_epi8(_mm_cmpgt_epi8(bcd_swapped, _mm_setzero_si128()));
     int tz = u64_tz_bits(mask);
@@ -780,6 +766,43 @@ static inline shortest_ascii16 to_ascii16_no_avx512(char* buf, const uint64_t m,
 }
 #endif  // XJB_USE_SSE2
 
+static inline uint64_t rotateRight64(uint64_t x, int s) {
+    return (x >> s) | (x << (64 - s));
+}
+
+static inline uint32_t countZeros(uint64_t x) {
+    const uint64_t maxUint64 = ~0ULL;
+    const uint64_t div1e8m = 0xc767074b22e90e21ULL;
+    const uint64_t div1e4m = 0xd288ce703afb7e91ULL;
+    const uint64_t div1e2m = 0x8f5c28f5c28f5c29ULL;
+    const uint64_t div1e1m = 0xcccccccccccccccdULL;
+    const uint64_t div1e8le = maxUint64 / 100000000;
+    const uint64_t div1e4le = maxUint64 / 10000;
+    const uint64_t div1e2le = maxUint64 / 100;
+    const uint64_t div1e1le = maxUint64 / 10;
+
+    uint64_t d;
+    uint32_t tz = 0;
+    // Cut 8 zeros, then 4, then 2, then 1.
+    if ((d = rotateRight64(x * div1e8m, 8)) <= div1e8le) {
+        x = d;
+        tz += 8;
+    }
+    if ((d = rotateRight64(x * div1e4m, 4)) <= div1e4le) {
+        x = d;
+        tz += 4;
+    }
+    if ((d = rotateRight64(x * div1e2m, 2)) <= div1e2le) {
+        x = d;
+        tz += 2;
+    }
+    if ((d = rotateRight64(x * div1e1m, 1)) <= div1e1le) {
+        x = d;
+        tz += 1;
+    }
+    return tz;
+}
+
 static inline shortest_ascii16 to_ascii16(char* buf, const uint64_t m, const uint64_t up_down, const uint64_t D17,
                                           const struct const_value_double* cv XJB_SHUFFLER_DECL) {
     // m range : [1, 1e16 - 1] ; m = abcdefgh * 10^8 + ijklmnop
@@ -803,38 +826,35 @@ static inline shortest_ascii16 to_ascii16(char* buf, const uint64_t m, const uin
 #    else
     uint64x1_t hundredmillions = {abcdefgh | ((uint64_t)ijklmnop << 32)};
 #    endif
-    int32x2_t high_10000 = vshr_n_u32(vqdmulh_s32(hundredmillions, vdup_n_s32(cv->multipliers32[0])), 9);
-    int32x2_t tenthousands = vmla_s32(hundredmillions, high_10000, vdup_n_s32(cv->multipliers32[1]));
-    int32x4_t extended = vshll_n_u16(tenthousands, 0);
+    int32x2_t high_10000 = vreinterpret_s32_u32(vshr_n_u32(
+        vreinterpret_u32_s32(vqdmulh_s32(vreinterpret_s32_u64(hundredmillions), vdup_n_s32(cv->multipliers32[0]))), 9));
+    int32x2_t tenthousands =
+        vmla_s32(vreinterpret_s32_u64(hundredmillions), high_10000, vdup_n_s32(cv->multipliers32[1]));
+    int32x4_t extended = vreinterpretq_s32_u32(vshll_n_u16(vreinterpret_u16_s32(tenthousands), 0));
 #    if defined(__clang__) || defined(__GNUC__)
     asm("" : "+w"(extended));
 #    endif
     int32x4_t high_100 = vqdmulhq_s32(extended, vdupq_n_s32(cv->multipliers32[2]));
     int32x4_t hundreds = vmlaq_s32(extended, high_100, vdupq_n_s32(cv->multipliers32[3]));
-    int16x8_t high_10 = vqdmulhq_s16(hundreds, vdupq_n_s16(cv->multipliers16[0]));
-    int16x8_t BCD_big_endian = vmlaq_s16(hundreds, high_10, vdupq_n_s16(cv->multipliers16[1]));
+    int16x8_t high_10 = vqdmulhq_s16(vreinterpretq_s16_s32(hundreds), vdupq_n_s16(cv->multipliers16[0]));
+    int16x8_t BCD_big_endian = vmlaq_s16(vreinterpretq_s16_s32(hundreds), high_10, vdupq_n_s16(cv->multipliers16[1]));
 #    if XJB_NO_MEMMOVE
     // BCD_big_endian -> is_not_zero -> zeroes -> tz (rbit and lz)
-    int8x16_t ascii16_swapped = vorrq_u8(BCD_big_endian, vdupq_n_s8('0'));
-    uint16x8_t is_not_zero = vcgtzq_s8(BCD_big_endian);
-    int8x16_t ascii16 = vqtbl1q_u8(ascii16_swapped, vld1q_u8(move_shuffler));
+    uint8x16_t ascii16_swapped = vorrq_u8(vreinterpretq_u8_s16(BCD_big_endian), vreinterpretq_u8_s8(vdupq_n_s8('0')));
+    uint16x8_t is_not_zero = vreinterpretq_u16_u8(vcgtzq_s8(vreinterpretq_s8_s16(BCD_big_endian)));
+    uint64x2_t ascii16 = vreinterpretq_u64_u8(vqtbl1q_u8(ascii16_swapped, vld1q_u8(move_shuffler)));
     uint64_t zeroes = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(is_not_zero, 4)), 0);
     int tz = u64_tz_bits(zeroes) >> 2;  // tz is slow on arm64 . tz = rbit and lz; two instruction.
     uint64_t dec_sig_len = up_down ? (XJB_NOT_REMOVE_FIRST_ZERO ? (14 + D17) - tz : 15 - tz) : 15 + D17;
     xjb_assume(dec_sig_len <= 16);
-    return {ascii16, dec_sig_len, vgetq_lane_s32(ascii16_swapped, 0)};
+    return {ascii16, dec_sig_len, vgetq_lane_s32(vreinterpretq_s32_u8(ascii16_swapped), 0)};
 #    else
 
-    // int8x16_t BCD_little_endian = vrev64q_u8(BCD_big_endian);
-    // int16x8_t ascii16 = vorrq_u64(BCD_little_endian, vdupq_n_s8('0'));
-    // ascii16 = vqtbl1q_u8(vreinterpretq_u8_u16(ascii16),
-    //                      vld1q_u8(&cv->shuffle_table_memmove[(15 + D17) & 16]));  // remove left zero
-
-    int8x16_t BCD_little_endian = vqtbl1q_u8(vreinterpretq_u8_u16(BCD_big_endian),
-                                             vld1q_u8(&cv->shuffle_table_neon[(15 + D17) & 16]));  // remove left zero
-    int16x8_t ascii16 = vorrq_u64(BCD_little_endian, vdupq_n_s8('0'));
+    uint8x16_t BCD_little_endian = vqtbl1q_u8(vreinterpretq_u8_s16(BCD_big_endian),
+                                              vld1q_u8(&cv->shuffle_table_neon[(15 + D17) & 16]));  // remove left zero
+    uint64x2_t ascii16 = vorrq_u64(vreinterpretq_u64_u8(BCD_little_endian), vreinterpretq_u64_s8(vdupq_n_s8('0')));
     vst1q_s8((int8_t*)buf, vdupq_n_s8('0'));  // write 32byte '0'
-    uint16x8_t is_not_zero = vcgtzq_s8(BCD_little_endian);
+    uint16x8_t is_not_zero = vreinterpretq_u16_u8(vcgtzq_s8(vreinterpretq_s8_u8(BCD_little_endian)));
     uint64_t zeroes = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(is_not_zero, 4)), 0);  // zeros != 0
     u32 tz = u64_lz_bits(zeroes) >> 2;
     uint32_t dec_sig_len = up_down ? ((0) ? (14 + D17) - tz : 15 - tz) : 15 + D17;
@@ -926,14 +946,15 @@ static inline shortest_ascii8 to_ascii8(const uint64_t m, const uint32_t up_down
                                         const struct const_value_float* c = nullptr) {
     // m range : [0, 1e8 - 1] ; m = abcdefgh
 #if XJB_USE_NEON
-    int32x2_t tenthousands = vcreate_u64(m + c->m * ((m * (u128)c->div10000) >> 64));
+    int32x2_t tenthousands = vreinterpret_s32_u64(vcreate_u64(m + c->m * ((m * (u128)c->div10000) >> 64)));
     int32x2_t hundreds = vmla_n_s32(tenthousands, vqdmulh_s32(tenthousands, vdup_n_s32(c->m32_4[0])), c->m32_4[1]);
-    // int16x4_t BCD_big_endian = vmla_n_s16(hundreds, vqdmulh_s16(hundreds, vdup_n_s16(0xce0)), -10 + 0x100);
-    int16x4_t BCD_big_endian = vmla_n_s16(hundreds, vqdmulh_s16(hundreds, vdup_n_s16(c->m32_4[2])),
-                                          c->m32_4[3]);
-    u64 hgfedcba_BCD = vget_lane_u64(BCD_big_endian, 0);
-    u64 abcdefgh_BCD =
-        byteswap64_xjb(vget_lane_u64(BCD_big_endian, 0));  // big_endian to little_endian , reverse 8 bytes
+
+    int16x4_t BCD_big_endian =
+        vmla_n_s16(vreinterpret_s16_s32(hundreds), vqdmulh_s16(vreinterpret_s16_s32(hundreds), vdup_n_s16(c->m32_4[2])),
+                   c->m32_4[3]);  // fewer instructions but slower,why?
+    u64 hgfedcba_BCD = vget_lane_u64(vreinterpret_u64_s16(BCD_big_endian), 0);
+    u64 abcdefgh_BCD = byteswap64_xjb(
+        vget_lane_u64(vreinterpret_u64_s16(BCD_big_endian), 0));  // big_endian to little_endian , reverse 8 bytes
 #elif XJB_USE_AVX512IFMA_VBMI
     __m512i bcstq_l = _mm512_set1_epi64(m);
     const __m512i zmmzero = _mm512_castsi128_si512(_mm_cvtsi64_si128(0x1A1A400));
@@ -984,13 +1005,14 @@ static inline char* write_1_to_16_digit(u64 x, char* buf, const struct const_val
     if (x < 100000000) {
         // write 1-8 digit
 #if XJB_USE_NEON
-        u64 abcd_efgh_u64 = xi + cv->div10000_m * ((xi * (u128)cv->div10000) >> 64);  // xi = abcdefgh
-        int32x2_t abcd_efgh = vld1_u64((uint64_t const*)&abcd_efgh_u64);              // (abcd << 32) + efgh
+        u64 abcd_efgh_u64 = xi + cv->div10000_m * ((xi * (u128)cv->div10000) >> 64);            // xi = abcdefgh
+        int32x2_t abcd_efgh = vreinterpret_s32_u64(vld1_u64((uint64_t const*)&abcd_efgh_u64));  // (abcd << 32) + efgh
         int32x2_t ab_cd_ef_gh = vmla_s32(abcd_efgh, vqdmulh_s32(abcd_efgh, vdup_n_s32(cv->multipliers32[2])),
                                          vdup_n_s32(cv->multipliers32[3]));
         int16x4_t a_b_c_d_e_f_g_h =
-            vmla_s16(ab_cd_ef_gh, vqdmulh_s16(ab_cd_ef_gh, vdup_n_s16(0xce0)), vdup_n_s16(-10 + 0x100));
-        u64 bcd_big_endian = vget_lane_u64(a_b_c_d_e_f_g_h, 0);
+            vmla_s16(vreinterpret_s16_s32(ab_cd_ef_gh),
+                     vqdmulh_s16(vreinterpret_s16_s32(ab_cd_ef_gh), vdup_n_s16(0xce0)), vdup_n_s16(-10 + 0x100));
+        u64 bcd_big_endian = vget_lane_u64(vreinterpret_u64_s16(a_b_c_d_e_f_g_h), 0);
         u64 lz = u64_lz_bits(bcd_big_endian) / 8;  // lz max is 7 , bcd_big_endian = 0 is impossible
         u64 abcdefgh_bcd = is_little_endian() ? byteswap64_xjb(bcd_big_endian) : bcd_big_endian;
         u64 abcdefgh_ascii = abcdefgh_bcd | ZERO;
@@ -1064,23 +1086,28 @@ static inline char* write_1_to_16_digit(u64 x, char* buf, const struct const_val
         uint32_t abcdefgh = ((__uint128_t)xi * cv->mul_const) >> 90;
         uint32_t ijklmnop = xi + abcdefgh * cv->hundred_million;
         uint64x1_t hundredmillions = {abcdefgh | ((uint64_t)ijklmnop << 32)};
-        int32x2_t high_10000 = vshr_n_u32(vqdmulh_s32(hundredmillions, vdup_n_s32(cv->multipliers32[0])), 9);
-        int32x2_t tenthousands = vmla_s32(hundredmillions, high_10000, vdup_n_s32(cv->multipliers32[1]));
-        int32x4_t extended = vshll_n_u16(tenthousands, 0);
+        int32x2_t high_10000 = vreinterpret_s32_u32(vshr_n_u32(
+            vreinterpret_u32_s32(vqdmulh_s32(vreinterpret_s32_u64(hundredmillions), vdup_n_s32(cv->multipliers32[0]))),
+            9));
+        int32x2_t tenthousands =
+            vmla_s32(vreinterpret_s32_u64(hundredmillions), high_10000, vdup_n_s32(cv->multipliers32[1]));
+        int32x4_t extended = vreinterpretq_s32_u32(vshll_n_u16(vreinterpret_u16_s32(tenthousands), 0));
 #    if XJB_IS_AARCH64 && (defined(__clang__) || defined(__GNUC__))
         // asm ("" : "+w"(extended));
 #    endif
         int32x4_t hundreds = vmlaq_s32(extended, vqdmulhq_s32(extended, vdupq_n_s32(cv->multipliers32[2])),
                                        vdupq_n_s32(cv->multipliers32[3]));
-        int16x8_t BCD_big_endian = vmlaq_s16(hundreds, vqdmulhq_s16(hundreds, vdupq_n_s16(cv->multipliers16[0])),
-                                             vdupq_n_s16(cv->multipliers16[1]));
-        int8x16_t BCD_little_endian = is_little_endian()
-                                          ? vrev64q_u8(BCD_big_endian)
-                                          : vreinterpretq_u8_u16(BCD_big_endian);  // big_endian to little_endian
-                                                                                   // , reverse 8 bytes
-        u64 abcdefgh_bcd = vgetq_lane_u64(BCD_little_endian, 0);                   // hi
-        u64 ijklmnop_bcd = vgetq_lane_u64(BCD_little_endian, 1);                   // lo
-        u64 abcdefgh_lz = u64_lz_bits(vgetq_lane_u64(BCD_big_endian, 0)) / 8;
+        int16x8_t BCD_big_endian =
+            vmlaq_s16(vreinterpretq_s16_s32(hundreds),
+                      vqdmulhq_s16(vreinterpretq_s16_s32(hundreds), vdupq_n_s16(cv->multipliers16[0])),
+                      vdupq_n_s16(cv->multipliers16[1]));
+        uint8x16_t BCD_little_endian = is_little_endian()
+                                           ? vrev64q_u8(vreinterpretq_u8_s16(BCD_big_endian))
+                                           : vreinterpretq_u8_s16(BCD_big_endian);      // big_endian to little_endian
+                                                                                        // , reverse 8 bytes
+        u64 abcdefgh_bcd = vgetq_lane_u64(vreinterpretq_u64_u8(BCD_little_endian), 0);  // hi
+        u64 ijklmnop_bcd = vgetq_lane_u64(vreinterpretq_u64_u8(BCD_little_endian), 1);  // lo
+        u64 abcdefgh_lz = u64_lz_bits(vgetq_lane_u64(vreinterpretq_u64_s16(BCD_big_endian), 0)) / 8;
         u64 abcdefgh_ascii = abcdefgh_bcd | ZERO;
         u64 ijklmnop_ascii = ijklmnop_bcd | ZERO;
         abcdefgh_ascii = is_little_endian() ? abcdefgh_ascii >> (8 * abcdefgh_lz) : abcdefgh_ascii << (8 * abcdefgh_lz);
@@ -1185,6 +1212,24 @@ static inline char* write_1_to_16_digit(u64 x, char* buf, const struct const_val
         return buf;
     }
 }
+static inline char* process_special_double(const u64 sig, const u64 exp, i64& q, u64& c, bool& is_exit,
+                                           char* const buf) {
+    // 0,5e-324,inf,nan
+    if (exp == 0) [[unlikely]] {
+        if (sig <= 1) {
+            is_exit = true;
+            return (char*)memcpy(buf, sig ? "5e-324\0" : "0.0\0\0\0\0", 8) + (sig ? 6 : 3);
+        }
+        c = sig;
+        q = 1 - 1075;  // -1074
+    }
+    if (exp == 2047) [[unlikely]] {
+        is_exit = true;
+        return (char*)memcpy(buf, sig ? "nan" : "inf", 4) + 3;
+    }
+    return buf;
+}
+
 static inline i64 compute_k_double(i64 q) {
     // return floor(q*log10(2));
 #if defined(__SIZEOF_INT128__) && XJB_IS_AARCH64
@@ -1194,19 +1239,13 @@ static inline i64 compute_k_double(i64 q) {
     return (q * 78913) >> 18;
 #endif
 }
+
 static inline void get_pow10(const struct double_table_t* t, const i64 k, u64* pow10_hi, u64* pow10_lo) {
-    const u64* pow10_ptr = t->pow10_double + 323 * 2 + 2 + k * 2;
-#if !XJB_NO_PIC_MITIGATION
-    // Under -fPIC this pow10 load sits on the double path's critical dependency
-    // chain. Left as `pow10_double[base + k*2]` it compiles to a scaled-index
-    // load (`movq disp(%base,%idx,8)`) which misses Zen4's fast AGU path and
-    // stalls the chain (~1.5-1.85x slower on Zen4). Folding the index into the
-    // base pointer via an opaque barrier makes it a base+disp load instead.
-    asm("" : "+r"(pow10_ptr));
-#endif
-    *pow10_hi = pow10_ptr[0];
-    *pow10_lo = pow10_ptr[1];
+    const u64* pow10_ptr = t->pow10_double + 323 * 2 + 2;
+    *pow10_hi = pow10_ptr[k * 2 + 0];
+    *pow10_lo = pow10_ptr[k * 2 + 1];
 }
+
 namespace xjb {
 static inline char* xjb64(double v, char* buf) {
     // require buf size >= 33 byte
@@ -1255,10 +1294,6 @@ static inline char* xjb64(double v, char* buf) {
     // d * 10**k satisfy Steele & White principle
 
     {
-        // this likely code is core conversion from binary to decimal.
-        // the binary result is c * 2**q , the decimal result is d * 10**k
-        // the decimal result is (m_up * 10 + (up_down ? 0 : one)) * 10**k
-        // we convert c * 2**q to d * 10**k
         u64 hi64, lo64, pow10_hi, pow10_lo;
         k = compute_k_double((i64)exp - 1075);
         get_pow10(t, k, &pow10_hi, &pow10_lo);
@@ -1289,6 +1324,7 @@ static inline char* xjb64(double v, char* buf) {
         if (dot_one == (1ULL << 62))  // round to even
             one = 2;
     }
+
     u64 D17 = m_up > (u64)cv->c3;     // (m_up >= (u64)1e15);
     u64 mr = D17 ? m_up : m_up * 10;  // remove the first digit zero
 

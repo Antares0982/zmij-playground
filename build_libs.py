@@ -140,12 +140,16 @@ def build_rust(output_dir: Path, extra_rustflags: str) -> bool:
 # --------------------------------------------------------------------------- #
 
 
-def build_xjb(output_dir: Path, cxx: str, extra_cflags: list[str]) -> None:
-    print("\n=== Building xjb ===", flush=True)
-    xjb_dir = ROOT / "xjb"
+def build_xjb(
+    output_dir: Path, cxx: str, extra_cflags: list[str], _xjb_dir: str | None = None
+) -> None:
+    if _xjb_dir is None:
+        _xjb_dir = "xjb"
+    print(f"\n=== Building {_xjb_dir} ===", flush=True)
+    xjb_dir = ROOT / _xjb_dir
     src = xjb_dir / "ftoa.cpp"
-    so_out = output_dir / "libxjb.so"
-    asm_out = output_dir / "xjb.s"
+    so_out = output_dir / f"lib{_xjb_dir}.so"
+    asm_out = output_dir / f"{_xjb_dir}.s"
 
     common = [
         cxx,
@@ -293,6 +297,7 @@ def main() -> None:
         for stale in ("libzmij_rust.so", "zmij_rust.s"):
             (output_dir / stale).unlink(missing_ok=True)
     build_xjb(output_dir, cxx, extra_cflags)
+    build_xjb(output_dir, cxx, extra_cflags, "xjb-old")
     build_asm(output_dir, cc, extra_cflags)
 
     print("\n=== Done ===")
