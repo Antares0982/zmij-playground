@@ -13,6 +13,7 @@
 #include <dlfcn.h>
 #include <libgen.h>
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +55,17 @@ typedef struct {
 } values_t;
 
 /* ---- Utility ------------------------------------------------------------ */
+
+/* printf-style progress logger that silently drops output when `f` is NULL.
+ * Passing NULL (as JSON mode does) suppresses all progress/info chatter while
+ * leaving genuine error/warning fprintf(stderr, ...) calls untouched. */
+static inline void log_info(FILE* f, const char* fmt, ...) {
+  if (!f) return;
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(f, fmt, ap);
+  va_end(ap);
+}
 
 static inline double timespec_diff_ns(const struct timespec* end,
                                       const struct timespec* start) {
@@ -127,22 +139,82 @@ static int cmp_double(const void* a, const void* b) {
   return (da > db) - (da < db);
 }
 
-static inline void print_stats(const char* name, double* round_ns, int rounds,
-                               size_t count, size_t sink_val) {
+typedef struct {
+  double min, p1, med, mean;
+  size_t sink;
+} bench_stats_t;
+
+/* Sort `round_ns` in place and reduce it to summary statistics. */
+static inline bench_stats_t compute_stats(double* round_ns, int rounds,
+                                          size_t count, size_t sink_val) {
   qsort(round_ns, (size_t)rounds, sizeof(double), cmp_double);
 
-  double min_ns = round_ns[0] / (double)count;
-  double p1_ns = round_ns[rounds / 100] / (double)count; /* P1  */
-  double med_ns = round_ns[rounds / 2] / (double)count;  /* P50 */
+  bench_stats_t s;
+  s.min = round_ns[0] / (double)count;
+  s.p1 = round_ns[rounds / 100] / (double)count; /* P1  */
+  s.med = round_ns[rounds / 2] / (double)count;  /* P50 */
 
   double total_ns = 0;
   for (int r = 0; r < rounds; r++) total_ns += round_ns[r];
-  double mean_ns = total_ns / ((double)rounds * (double)count);
+  s.mean = total_ns / ((double)rounds * (double)count);
+  s.sink = sink_val;
+  return s;
+}
 
+static inline void print_stats_line(const char* name, bench_stats_t s) {
   printf(
       "  %-24s  min %7.2f  P1 %7.2f  med %7.2f  mean %7.2f ns/call  "
       "(sink=%zu)\n",
-      name, min_ns, p1_ns, med_ns, mean_ns, sink_val);
+      name, s.min, s.p1, s.med, s.mean, s.sink);
+}
+
+/* Sort, summarize, and print in one step (human-readable output). */
+static inline void print_stats(const char* name, double* round_ns, int rounds,
+                               size_t count, size_t sink_val) {
+  print_stats_line(name, compute_stats(round_ns, rounds, count, sink_val));
+}
+
+/* ---- JSON output -------------------------------------------------------- */
+/*
+ * Emit an indent-4 JSON document, nested by lib:
+ *   {
+ *       "<name>": {
+ *           "float":  { "min": .., "P1": .., "med": .., "mean": .., "sink": ..
+ * }, "double": { ... }
+ *       },
+ *       ...
+ *   }
+ * The "float" member is omitted for libs whose has_float[] entry is 0.
+ */
+
+static inline void json_emit_stats(const bench_stats_t* s, int indent) {
+  printf("{\n");
+  printf("%*s\"min\": %.2f,\n", indent + 4, "", s->min);
+  printf("%*s\"P1\": %.2f,\n", indent + 4, "", s->p1);
+  printf("%*s\"med\": %.2f,\n", indent + 4, "", s->med);
+  printf("%*s\"mean\": %.2f,\n", indent + 4, "", s->mean);
+  printf("%*s\"sink\": %zu\n", indent + 4, "", s->sink);
+  printf("%*s}", indent, "");
+}
+
+static inline void json_emit_document(const char** names,
+                                      const bench_stats_t* fstats,
+                                      const int* has_float,
+                                      const bench_stats_t* dstats, int nlibs) {
+  printf("{\n");
+  for (int i = 0; i < nlibs; i++) {
+    printf("    \"%s\": {\n", names[i]);
+    if (has_float[i]) {
+      printf("        \"float\": ");
+      json_emit_stats(&fstats[i], 8);
+      printf(",\n");
+    }
+    printf("        \"double\": ");
+    json_emit_stats(&dstats[i], 8);
+    printf("\n");
+    printf("    }%s\n", i + 1 < nlibs ? "," : "");
+  }
+  printf("}\n");
 }
 
 /* ---- Benchmark ---------------------------------------------------------- */
