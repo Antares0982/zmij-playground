@@ -32,19 +32,24 @@ static void usage(const char* prog) {
           "  --rounds <N>         Total benchmark rounds per lib (default: "
           "5000)\n"
           "  --repeats <M>        Shuffled passes; each pass runs N/M rounds "
-          "per lib (default: 5)\n",
+          "per lib (default: 5)\n"
+          "  --json               Emit results as JSON on stdout; all other "
+          "output goes to stderr\n",
           prog, DEFAULT_SYM_DOUBLE, DEFAULT_SYM_FLOAT, DEFAULT_INPUT_PATH);
 }
 
 int main(int argc, char** argv) {
   int rounds = 5000;
   int repeats = 5;
+  int json_mode = 0;
   const char* input_path = DEFAULT_INPUT_PATH;
   const char* lib_specs[MAX_LIBS];
   int n_specs = 0;
 
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "--rounds") == 0 && i + 1 < argc) {
+    if (strcmp(argv[i], "--json") == 0) {
+      json_mode = 1;
+    } else if (strcmp(argv[i], "--rounds") == 0 && i + 1 < argc) {
       rounds = atoi(argv[++i]);
       if (rounds <= 0) {
         fprintf(stderr, "Invalid rounds: %s\n", argv[i]);
@@ -76,9 +81,12 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  printf("Reading values from: %s\n", input_path);
+  /* In JSON mode stdout carries only the JSON document, and progress/info
+   * chatter is suppressed entirely (`info` is NULL). Genuine errors still go
+   * to stderr directly; in human mode `info` is stdout as before. */
+  FILE* info = json_mode ? NULL : stdout;
+
   values_t vals = read_values(input_path);
-  printf("Loaded %zu values.\n\n", vals.count);
   if (vals.count == 0) {
     fprintf(stderr, "Error: input file is empty.\n");
     return 1;
@@ -92,7 +100,6 @@ int main(int argc, char** argv) {
     dtoa_lib_t lib = parse_and_load(lib_specs[i]);
     if (lib.handle) {
       libs[nlibs++] = lib;
-      printf("  Loaded: %s\n", lib.name);
     } else {
       fprintf(stderr, "  Failed to load: %s\n", lib_specs[i]);
     }
@@ -102,7 +109,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "Error: no libraries could be loaded.\n");
     return 1;
   }
-  printf("\n");
+  log_info(info, "\n");
 
   /* Pin to a single core to reduce scheduling noise */
   pin_to_core(1);
@@ -126,6 +133,9 @@ int main(int argc, char** argv) {
   double* f_buf[MAX_LIBS];
   size_t d_sink[MAX_LIBS];
   size_t f_sink[MAX_LIBS];
+  bench_stats_t f_stats[MAX_LIBS];
+  bench_stats_t d_stats[MAX_LIBS];
+  int has_float_lib[MAX_LIBS];
   for (int i = 0; i < nlibs; i++) {
     d_buf[i] = (double*)malloc((size_t)total_rounds * sizeof(double));
     f_buf[i] = libs[i].wf
@@ -133,15 +143,16 @@ int main(int argc, char** argv) {
                    : NULL;
     d_sink[i] = 0;
     f_sink[i] = 0;
+    has_float_lib[i] = libs[i].wf != NULL;
   }
   int order[MAX_LIBS];
 
   /* Benchmark: float */
   if (has_float) {
-    printf(
-        "=== float benchmark (%d rounds × %zu values, %d repeats, %d "
-        "warmup) ===\n",
-        total_rounds, vals.count, repeats, WARMUP_ROUNDS);
+    log_info(info,
+             "=== float benchmark (%d rounds × %zu values, %d repeats, %d "
+             "warmup) ===\n",
+             total_rounds, vals.count, repeats, WARMUP_ROUNDS);
     for (int rep = 0; rep < repeats; rep++) {
       fflush(stdout);
       rotate_order(order, nlibs, rep);
@@ -154,18 +165,18 @@ int main(int argc, char** argv) {
       }
     }
     for (int i = 0; i < nlibs; i++) {
-      if (libs[i].wf)
-        print_stats(libs[i].name, f_buf[i], total_rounds, vals.count,
-                    f_sink[i]);
+      if (!libs[i].wf) continue;
+      f_stats[i] = compute_stats(f_buf[i], total_rounds, vals.count, f_sink[i]);
+      if (!json_mode) print_stats_line(libs[i].name, f_stats[i]);
     }
-    printf("\n");
+    log_info(info, "\n");
   }
 
   /* Benchmark: double */
-  printf(
-      "=== double benchmark (%d rounds × %zu values, %d repeats, %d warmup) "
-      "===\n",
-      total_rounds, vals.count, repeats, WARMUP_ROUNDS);
+  log_info(info,
+           "=== double benchmark (%d rounds × %zu values, %d repeats, %d "
+           "warmup) ===\n",
+           total_rounds, vals.count, repeats, WARMUP_ROUNDS);
   for (int rep = 0; rep < repeats; rep++) {
     fflush(stdout);
     rotate_order(order, nlibs, rep);
@@ -176,9 +187,17 @@ int main(int argc, char** argv) {
                                     d_buf[i] + rep * block, block, d_sink[i]);
     }
   }
-  for (int i = 0; i < nlibs; i++)
-    print_stats(libs[i].name, d_buf[i], total_rounds, vals.count, d_sink[i]);
-  printf("\n");
+  for (int i = 0; i < nlibs; i++) {
+    d_stats[i] = compute_stats(d_buf[i], total_rounds, vals.count, d_sink[i]);
+    if (!json_mode) print_stats_line(libs[i].name, d_stats[i]);
+  }
+  log_info(info, "\n");
+
+  if (json_mode) {
+    const char* names[MAX_LIBS];
+    for (int i = 0; i < nlibs; i++) names[i] = libs[i].name;
+    json_emit_document(names, f_stats, has_float_lib, d_stats, nlibs);
+  }
 
   /* Cleanup */
   for (int i = 0; i < nlibs; i++) {

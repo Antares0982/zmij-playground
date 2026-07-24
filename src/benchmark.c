@@ -54,7 +54,7 @@ static dtoa_lib_t try_load_lib(const char* dir, const char* filename,
 /* ---- Verification ------------------------------------------------------ */
 
 static int verify_double(const dtoa_lib_t* libs, int nlibs, const double* vals,
-                         size_t count) {
+                         size_t count, FILE* out) {
   char bufs[MAX_LIBS][64];
   int mismatches = 0;
 
@@ -73,13 +73,14 @@ static int verify_double(const dtoa_lib_t* libs, int nlibs, const double* vals,
     }
 
     if (mismatch) {
-      if (mismatches == 0) printf("  *** double mismatches detected ***\n");
+      if (mismatches == 0)
+        fprintf(out, "  *** double mismatches detected ***\n");
       char std_buf[64];
       snprintf(std_buf, sizeof(std_buf), "%.*g", 17, vals[i]);
-      printf("  [%zu] stdlib=%-24s", i, std_buf);
+      fprintf(out, "  [%zu] stdlib=%-24s", i, std_buf);
       for (int k = 0; k < nlibs; k++)
-        printf("  %s=%-24s", libs[k].name, bufs[k]);
-      printf("\n");
+        fprintf(out, "  %s=%-24s", libs[k].name, bufs[k]);
+      fprintf(out, "\n");
       mismatches++;
     }
   }
@@ -97,7 +98,9 @@ static void usage(const char* prog) {
           "compile-time DEFAULT_LIB_DIR)\n"
           "  --rounds <N>      Total benchmark rounds per lib (default: 5000)\n"
           "  --repeats <M>     Shuffled passes; each pass runs N/M rounds "
-          "per lib (default: 5)\n",
+          "per lib (default: 5)\n"
+          "  --json            Emit results as JSON on stdout; all other "
+          "output goes to stderr\n",
           prog);
 }
 
@@ -106,10 +109,13 @@ int main(int argc, char** argv) {
   const char* input_path = NULL;
   int rounds = 5000;
   int repeats = 5;
+  int json_mode = 0;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "--lib-dir") == 0 && i + 1 < argc) {
       lib_dir = argv[++i];
+    } else if (strcmp(argv[i], "--json") == 0) {
+      json_mode = 1;
     } else if (strcmp(argv[i], "--rounds") == 0 && i + 1 < argc) {
       rounds = atoi(argv[++i]);
       if (rounds <= 0) {
@@ -140,16 +146,20 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  printf("Reading values from: %s\n", input_path);
+  /* In JSON mode stdout carries only the JSON document, and progress/info
+   * chatter is suppressed entirely (`info` is NULL). Warnings still surface
+   * on stderr via `warn`; in human mode both stay on stdout as before. */
+  FILE* info = json_mode ? NULL : stdout;
+  FILE* warn = json_mode ? stderr : stdout;
+
   values_t vals = read_values(input_path);
-  printf("Loaded %zu values.\n\n", vals.count);
   if (vals.count == 0) {
     fprintf(stderr, "Error: input file is empty.\n");
     return 1;
   }
 
   /* Load libraries — all are optional */
-  printf("Loading libraries from: %s\n", lib_dir);
+  log_info(info, "Loading libraries from: %s\n", lib_dir);
   dtoa_lib_t libs[MAX_LIBS];
   int nlibs = 0;
 
@@ -172,9 +182,8 @@ int main(int argc, char** argv) {
                      lib_specs[i].sym_float, lib_specs[i].sym_double);
     if (lib.handle) {
       libs[nlibs++] = lib;
-      printf("  Loaded: %s\n", lib_specs[i].name);
     } else {
-      printf("  Not available: %s (skipped)\n", lib_specs[i].name);
+      log_info(info, "  Not available: %s (skipped)\n", lib_specs[i].name);
     }
   }
 
@@ -182,7 +191,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "Error: no libraries could be loaded.\n");
     return 1;
   }
-  printf("\n");
+  log_info(info, "\n");
 
   /* Each repeat runs `block` rounds per lib in rotated order, so every lib
    * is sampled across the same range of thermal/frequency states. */
@@ -194,19 +203,23 @@ int main(int argc, char** argv) {
   double* f_buf[MAX_LIBS];
   size_t d_sink[MAX_LIBS];
   size_t f_sink[MAX_LIBS];
+  bench_stats_t f_stats[MAX_LIBS];
+  bench_stats_t d_stats[MAX_LIBS];
+  int has_float[MAX_LIBS];
   for (int i = 0; i < nlibs; i++) {
     d_buf[i] = (double*)malloc((size_t)total_rounds * sizeof(double));
     f_buf[i] = (double*)malloc((size_t)total_rounds * sizeof(double));
     d_sink[i] = 0;
     f_sink[i] = 0;
+    has_float[i] = 1;
   }
   int order[MAX_LIBS];
 
   /* Benchmark: float */
-  printf(
-      "=== float benchmark (%d rounds × %zu values, %d repeats, %d "
-      "warmup) ===\n",
-      total_rounds, vals.count, repeats, WARMUP_ROUNDS);
+  log_info(info,
+           "=== float benchmark (%d rounds × %zu values, %d repeats, %d "
+           "warmup) ===\n",
+           total_rounds, vals.count, repeats, WARMUP_ROUNDS);
   for (int rep = 0; rep < repeats; rep++) {
     fflush(stdout);
     rotate_order(order, nlibs, rep);
@@ -217,15 +230,17 @@ int main(int argc, char** argv) {
                                    f_buf[i] + rep * block, block, f_sink[i]);
     }
   }
-  for (int i = 0; i < nlibs; i++)
-    print_stats(libs[i].name, f_buf[i], total_rounds, vals.count, f_sink[i]);
-  printf("\n");
+  for (int i = 0; i < nlibs; i++) {
+    f_stats[i] = compute_stats(f_buf[i], total_rounds, vals.count, f_sink[i]);
+    if (!json_mode) print_stats_line(libs[i].name, f_stats[i]);
+  }
+  log_info(info, "\n");
 
   /* Benchmark: double */
-  printf(
-      "=== double benchmark (%d rounds × %zu values, %d repeats, %d "
-      "warmup) ===\n",
-      total_rounds, vals.count, repeats, WARMUP_ROUNDS);
+  log_info(info,
+           "=== double benchmark (%d rounds × %zu values, %d repeats, %d "
+           "warmup) ===\n",
+           total_rounds, vals.count, repeats, WARMUP_ROUNDS);
   for (int rep = 0; rep < repeats; rep++) {
     fflush(stdout);
     rotate_order(order, nlibs, rep);
@@ -236,18 +251,26 @@ int main(int argc, char** argv) {
                                     d_buf[i] + rep * block, block, d_sink[i]);
     }
   }
-  for (int i = 0; i < nlibs; i++)
-    print_stats(libs[i].name, d_buf[i], total_rounds, vals.count, d_sink[i]);
-  printf("\n");
+  for (int i = 0; i < nlibs; i++) {
+    d_stats[i] = compute_stats(d_buf[i], total_rounds, vals.count, d_sink[i]);
+    if (!json_mode) print_stats_line(libs[i].name, d_stats[i]);
+  }
+  log_info(info, "\n");
 
-  /* Verify consistency */
-  printf("=== Verifying output consistency ===\n");
-  int dmm = verify_double(libs, nlibs, vals.d, vals.count);
+  /* Verify consistency — mismatches are warnings and stay visible in JSON
+   * mode (on stderr); the header and success line are suppressed there. */
+  log_info(info, "=== Verifying output consistency ===\n");
+  int dmm = verify_double(libs, nlibs, vals.d, vals.count, warn);
   if (dmm == 0)
-    printf("  All %zu values: outputs are identical.\n", vals.count);
+    log_info(info, "  All %zu values: outputs are identical.\n", vals.count);
   else
-    printf("  double mismatches: %d\n", dmm);
-  printf("\n");
+    fprintf(warn, "  double mismatches: %d\n", dmm);
+  log_info(info, "\n");
+
+  /* Names for JSON emission */
+  const char* names[MAX_LIBS];
+  for (int i = 0; i < nlibs; i++) names[i] = libs[i].name;
+  if (json_mode) json_emit_document(names, f_stats, has_float, d_stats, nlibs);
 
   for (int i = 0; i < nlibs; i++) {
     free(d_buf[i]);
